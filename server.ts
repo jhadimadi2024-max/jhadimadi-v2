@@ -238,8 +238,8 @@ async function startServer() {
   };
 
   // 1.5 Supabase Cloud Database & Storage Client Initialization
-  const DEFAULT_SUPABASE_KEY = 'sb_publishable_utZQt6eGEVnO4h9I5o_MaQ_Me';
-  const DEFAULT_SUPABASE_URL = 'https://krmvdvhhtidqydlfnhmm.supabase.co';
+  const DEFAULT_SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR3aHNxZnRsbGt4aW1oZnZ3cWFrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk3MzAyNzEsImV4cCI6MjEwNTMwNjI3MX0.GbceleQmKhRfSzE-c_Bq3fh-YA7I4oZI1fGCsU-SaPI';
+  const DEFAULT_SUPABASE_URL = 'https://dwhsqftllkximhfvwqak.supabase.co';
 
   const sanitizeSupabaseServerUrl = (url: any): string => {
     if (!url || typeof url !== 'string') return DEFAULT_SUPABASE_URL;
@@ -263,6 +263,9 @@ async function startServer() {
   const sanitizeSupabaseServerKey = (key: any): string => {
     const candidate = (!key || typeof key !== 'string') ? DEFAULT_SUPABASE_KEY : key;
     let clean = candidate.trim().replace(/[)\s'"`;]+$/, '').replace(/[^a-zA-Z0-9_\-.]/g, '');
+    if (clean.startsWith('sb_publishable_') && clean.length > 20) {
+      return clean;
+    }
     if (clean.startsWith('eyJhGci')) {
       clean = clean.replace(/^eyJhGci/, 'eyJhbGci');
     }
@@ -330,29 +333,283 @@ async function startServer() {
   }
 
   // ================= J-PAY WALLET (SUPABASE AUTH + ATOMIC RPC) =================
-  if (serverSupabase) {
-    const walletController = createWalletController(serverSupabase);
-    app.get('/api/wallet/balance', walletController.requireUser, walletController.balance);
-    app.post('/api/wallet/add-money', walletController.requireUser, walletController.addMoney);
-    app.post('/api/wallet/transfer', walletController.requireUser, walletController.transfer);
-    app.post('/api/wallet/purchase', walletController.requireUser, walletController.purchase);
-    app.post('/api/wallet/withdraw', walletController.requireUser, walletController.withdraw);
-    app.post('/api/admin/wallet/add-money/:id/approve', walletController.requireAdmin, walletController.approveAddMoney);
-    app.post('/api/admin/wallet/withdrawals/:id/approve', walletController.requireAdmin, walletController.approveWithdrawal);
-  }
+  const walletController = createWalletController(serverSupabase);
+  app.get('/api/wallet/balance', walletController.requireUser, walletController.balance);
+  app.post('/api/wallet/add-money', walletController.requireUser, walletController.addMoney);
+  app.post('/api/wallet/transfer', walletController.requireUser, walletController.transfer);
+  app.post('/api/wallet/purchase', walletController.requireUser, walletController.purchase);
+  app.post('/api/wallet/withdraw', walletController.requireUser, walletController.withdraw);
+  app.get('/api/wallet/user-add-money-requests', walletController.requireUser, walletController.getUserAddMoneyRequests);
+  app.get('/api/wallet/user-withdrawals', walletController.requireUser, walletController.getUserWithdrawals);
+  app.get('/api/admin/wallet/add-money/pending', walletController.requireAdmin, walletController.getPendingAddMoney);
+  app.post('/api/admin/wallet/add-money/:id/approve', walletController.requireAdmin, walletController.approveAddMoney);
+  app.get('/api/admin/wallet/withdrawals/pending', walletController.requireAdmin, walletController.getPendingWithdrawals);
+  app.post('/api/admin/wallet/withdrawals/:id/approve', walletController.requireAdmin, walletController.approveWithdrawal);
+  app.get('/api/admin/wallet/transactions', walletController.requireAdmin, walletController.getAllTransactions);
 
-  // Secure Admin Authentication & Authorization Engine
-  // ================= J-PAY WALLET (SUPABASE AUTH + ATOMIC RPC) =================
-  if (serverSupabase) {
-    const walletController = createWalletController(serverSupabase);
-    app.get('/api/wallet/balance', walletController.requireUser, walletController.balance);
-    app.post('/api/wallet/add-money', walletController.requireUser, walletController.addMoney);
-    app.post('/api/wallet/transfer', walletController.requireUser, walletController.transfer);
-    app.post('/api/wallet/purchase', walletController.requireUser, walletController.purchase);
-    app.post('/api/wallet/withdraw', walletController.requireUser, walletController.withdraw);
-    app.post('/api/admin/wallet/add-money/:id/approve', walletController.requireAdmin, walletController.approveAddMoney);
-    app.post('/api/admin/wallet/withdrawals/:id/approve', walletController.requireAdmin, walletController.approveWithdrawal);
-  }
+  // =========================================================================
+  // DUPLICATE REGISTRATION DATA VALIDATION API
+  // Checks Phone, NID, and Email uniqueness across Supabase tables and local records
+  // =========================================================================
+  app.post('/api/registration/check-duplicates', async (req, res) => {
+    try {
+      const { phone, nid, email, excludeId } = req.body || {};
+
+      const normalizeBDPhone = (val: string) => {
+        if (!val) return '';
+        let p = String(val).trim().replace(/[\s\-()]/g, '');
+        if (p.startsWith('+880')) p = '0' + p.substring(4);
+        else if (p.startsWith('880')) p = '0' + p.substring(3);
+        return p;
+      };
+
+      // 1. Phone Number Uniqueness Check (Mandatory across all forms)
+      if (phone) {
+        const cleanPhone = normalizeBDPhone(phone);
+        if (cleanPhone.length >= 10) {
+          const variants = [cleanPhone, `+88${cleanPhone}`, `+880${cleanPhone.replace(/^0/, '')}`, `88${cleanPhone}`];
+
+          if (serverSupabase) {
+            // Check 'profiles'
+            try {
+              const { data: profs } = await serverSupabase
+                .from('profiles')
+                .select('id, phone, full_name')
+                .or(variants.map((p: string) => `phone.eq.${p}`).join(','))
+                .limit(2);
+              if (profs && profs.length > 0) {
+                const match = profs.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'profiles', matchedValue: match.phone, existingName: match.full_name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            // Check 'permanent_members'
+            try {
+              const { data: members } = await serverSupabase
+                .from('permanent_members')
+                .select('id, phone_number, name')
+                .or(variants.map((p: string) => `phone_number.eq.${p}`).join(','))
+                .limit(2);
+              if (members && members.length > 0) {
+                const match = members.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'permanent_members', matchedValue: match.phone_number, existingName: match.name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            // Check 'service_providers'
+            try {
+              const { data: pros } = await serverSupabase
+                .from('service_providers')
+                .select('id, phone, name')
+                .or(variants.map((p: string) => `phone.eq.${p}`).join(','))
+                .limit(2);
+              if (pros && pros.length > 0) {
+                const match = pros.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'service_providers', matchedValue: match.phone, existingName: match.name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            // Check 'blood_donors'
+            try {
+              const { data: donors } = await serverSupabase
+                .from('blood_donors')
+                .select('id, phone, name')
+                .or(variants.map((p: string) => `phone.eq.${p}`).join(','))
+                .limit(2);
+              if (donors && donors.length > 0) {
+                const match = donors.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'blood_donors', matchedValue: match.phone, existingName: match.name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            // Check 'product_sellers'
+            try {
+              const { data: sellers } = await serverSupabase
+                .from('product_sellers')
+                .select('id, phone_number, shop_name')
+                .or(variants.map((p: string) => `phone_number.eq.${p}`).join(','))
+                .limit(2);
+              if (sellers && sellers.length > 0) {
+                const match = sellers.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'product_sellers', matchedValue: match.phone_number, existingName: match.shop_name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            // Check 'sellers'
+            try {
+              const { data: sRows } = await serverSupabase
+                .from('sellers')
+                .select('id, phone, shop_name')
+                .or(variants.map((p: string) => `phone.eq.${p}`).join(','))
+                .limit(2);
+              if (sRows && sRows.length > 0) {
+                const match = sRows.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'sellers', matchedValue: match.phone, existingName: match.shop_name }
+                  });
+                }
+              }
+            } catch (_) {}
+          }
+
+          // Check local JSON files (registered_members, service_providers, blood_donors)
+          try {
+            const memFile = path.join(process.cwd(), 'data', 'registered_members.json');
+            if (fs.existsSync(memFile)) {
+              const membersList = JSON.parse(fs.readFileSync(memFile, 'utf-8'));
+              if (Array.isArray(membersList)) {
+                const match = membersList.find((m: any) => normalizeBDPhone(m.phone) === cleanPhone);
+                if (match && (!excludeId || match.id !== excludeId)) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'phone',
+                    message: 'এই ফোন নম্বরটি দিয়ে পূর্বেই রেজিস্ট্রেশন করা হয়েছে।',
+                    details: { table: 'registered_members.json', matchedValue: match.phone, existingName: match.name }
+                  });
+                }
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
+      // 2. NID Number Uniqueness Check (Permanent Member form & others)
+      if (nid) {
+        const cleanNid = String(nid).trim();
+        if (cleanNid.length >= 5) {
+          if (serverSupabase) {
+            try {
+              const { data: members } = await serverSupabase
+                .from('permanent_members')
+                .select('id, nid_number, name')
+                .eq('nid_number', cleanNid)
+                .limit(2);
+              if (members && members.length > 0) {
+                const match = members.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'nid',
+                    message: 'এই এনআইডি (NID) নম্বরটি দিয়ে ইতিমধ্যেই একজন সদস্য নিবন্ধিত রয়েছেন।',
+                    details: { table: 'permanent_members', matchedValue: match.nid_number, existingName: match.name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            try {
+              const { data: profs } = await serverSupabase
+                .from('profiles')
+                .select('id, nid_number, full_name')
+                .eq('nid_number', cleanNid)
+                .limit(2);
+              if (profs && profs.length > 0) {
+                const match = profs.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'nid',
+                    message: 'এই এনআইডি (NID) নম্বরটি দিয়ে ইতিমধ্যেই একজন সদস্য নিবন্ধিত রয়েছেন।',
+                    details: { table: 'profiles', matchedValue: match.nid_number, existingName: match.full_name }
+                  });
+                }
+              }
+            } catch (_) {}
+          }
+        }
+      }
+
+      // 3. Email Uniqueness Check (where applicable)
+      if (email) {
+        const cleanEmail = String(email).trim().toLowerCase();
+        if (cleanEmail && cleanEmail.includes('@') && cleanEmail.includes('.')) {
+          if (serverSupabase) {
+            try {
+              const { data: profs } = await serverSupabase
+                .from('profiles')
+                .select('id, email, full_name')
+                .ilike('email', cleanEmail)
+                .limit(2);
+              if (profs && profs.length > 0) {
+                const match = profs.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'email',
+                    message: 'এই ইমেইল ঠিকানাটি দিয়ে পূর্বেই অ্যাকাউন্ট তৈরি করা হয়েছে।',
+                    details: { table: 'profiles', matchedValue: match.email, existingName: match.full_name }
+                  });
+                }
+              }
+            } catch (_) {}
+
+            try {
+              const { data: pros } = await serverSupabase
+                .from('service_providers')
+                .select('id, email, name')
+                .ilike('email', cleanEmail)
+                .limit(2);
+              if (pros && pros.length > 0) {
+                const match = pros.find((r: any) => !excludeId || r.id !== excludeId);
+                if (match) {
+                  return res.json({
+                    isDuplicate: true,
+                    field: 'email',
+                    message: 'এই ইমেইল ঠিকানাটি দিয়ে পূর্বেই অ্যাকাউন্ট তৈরি করা হয়েছে।',
+                    details: { table: 'service_providers', matchedValue: match.email, existingName: match.name }
+                  });
+                }
+              }
+            } catch (_) {}
+          }
+        }
+      }
+
+      return res.json({ isDuplicate: false });
+    } catch (err: any) {
+      console.warn('[RegistrationDuplicateCheck] Error:', err);
+      return res.json({ isDuplicate: false, error: err?.message });
+    }
+  });
 
   // Secure Admin Authentication & Authorization Engine
   // Uses environment variable or persistent cryptographic random secret key
@@ -3060,8 +3317,20 @@ async function startServer() {
         uploadClient = serverSupabase;
       }
 
-      // Upload directly to public Supabase Storage Bucket ('banners' or 'products')
-      const ALLOWED_BUCKETS = ['products', 'banners', 'public-banners', 'avatars', 'business-media', 'service-media'];
+      // 1. Always persist image locally to public/assets/uploads to ensure images never get lost during remixing
+      const uploadsDir = path.join(process.cwd(), 'public', 'assets', 'uploads');
+      try {
+        if (!fs.existsSync(uploadsDir)) {
+          fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(uploadsDir, fileName), buffer);
+      } catch (writeErr) {
+        console.warn('[Local Storage Backup Warning]:', writeErr);
+      }
+      const localPublicUrl = `/assets/uploads/${fileName}`;
+
+      // 2. Upload directly to public Supabase Storage Bucket ('banners' or 'products')
+      const ALLOWED_BUCKETS = ['products', 'banners', 'public-banners', 'avatars', 'business-media', 'service-media', 'nid_documents'];
       const reqBucket = (req.body.bucket as string) || '';
       const isBannerUpload = reqBucket === 'banners' || (rawName && rawName.toLowerCase().includes('banner'));
       let targetBucket = isBannerUpload ? 'banners' : (reqBucket || 'products');
@@ -3071,73 +3340,96 @@ async function startServer() {
       let bucketUsed = targetBucket;
       let uploadErr: any = null;
       let uploadData: any = null;
+      let cloudUploadSuccess = false;
 
-      const firstTry = await uploadClient.storage
-        .from(targetBucket)
-        .upload(fileName, buffer, {
-          contentType: mimeType,
-          upsert: true,
-          cacheControl: '31536000'
-        });
-
-      if (!firstTry.error && firstTry.data) {
-        uploadData = firstTry.data;
-        bucketUsed = targetBucket;
-      } else {
-        uploadErr = firstTry.error;
-        // Product media has one canonical bucket: products.
-        const fallbackBucket = targetBucket === 'banners' ? 'banners' : 'products';
-        const secondTry = await uploadClient.storage
-          .from(fallbackBucket)
+      try {
+        const firstTry = await uploadClient.storage
+          .from(targetBucket)
           .upload(fileName, buffer, {
             contentType: mimeType,
             upsert: true,
             cacheControl: '31536000'
           });
-        if (!secondTry.error && secondTry.data) {
-          uploadData = secondTry.data;
-          bucketUsed = fallbackBucket;
-          uploadErr = null;
+
+        if (!firstTry.error && firstTry.data) {
+          uploadData = firstTry.data;
+          bucketUsed = targetBucket;
+          cloudUploadSuccess = true;
+        } else {
+          uploadErr = firstTry.error;
+          // Product media has one canonical bucket: products
+          const fallbackBucket = targetBucket === 'banners' ? 'banners' : 'products';
+          const secondTry = await uploadClient.storage
+            .from(fallbackBucket)
+            .upload(fileName, buffer, {
+              contentType: mimeType,
+              upsert: true,
+              cacheControl: '31536000'
+            });
+          if (!secondTry.error && secondTry.data) {
+            uploadData = secondTry.data;
+            bucketUsed = fallbackBucket;
+            uploadErr = null;
+            cloudUploadSuccess = true;
+          }
         }
+      } catch (clientCatchErr: any) {
+        uploadErr = clientCatchErr;
       }
 
       // If Supabase JS client had an issue, attempt direct REST call with strict Authorization header
-      if (uploadErr) {
-        const restHeaders: Record<string, string> = {
-          'Content-Type': mimeType,
-          'cache-control': '31536000',
-          'apikey': effectiveKey,
-          'Authorization': `Bearer ${bearerToken || effectiveKey}`
-        };
-        const uploadEndpoint = `${SUPABASE_STORAGE_URL}/storage/v1/object/${bucketUsed}/${fileName}`;
-        const restRes = await fetch(uploadEndpoint, {
-          method: 'POST',
-          headers: restHeaders,
-          body: buffer
-        });
+      if (!cloudUploadSuccess && uploadErr) {
+        try {
+          const restHeaders: Record<string, string> = {
+            'Content-Type': mimeType,
+            'cache-control': '31536000',
+            'apikey': effectiveKey,
+            'Authorization': `Bearer ${bearerToken || effectiveKey}`
+          };
+          const uploadEndpoint = `${SUPABASE_STORAGE_URL}/storage/v1/object/${bucketUsed}/${fileName}`;
+          const restRes = await fetch(uploadEndpoint, {
+            method: 'POST',
+            headers: restHeaders,
+            body: buffer
+          });
 
-        if (!restRes.ok) {
-          const errText = await restRes.text();
-          let parsedMsg = errText;
-          try {
-            const jsonErr = JSON.parse(errText);
-            parsedMsg = jsonErr.message || jsonErr.error || errText;
-          } catch {}
-          throw new Error(`Supabase Storage REST upload failed (${restRes.status}): ${parsedMsg}`);
+          if (restRes.ok) {
+            cloudUploadSuccess = true;
+          } else {
+            const errText = await restRes.text();
+            let parsedMsg = errText;
+            try {
+              const jsonErr = JSON.parse(errText);
+              parsedMsg = jsonErr.message || jsonErr.error || errText;
+            } catch {}
+            console.warn(`[Supabase Storage REST Upload Status ${restRes.status}]:`, parsedMsg);
+            // Check if this is the is_staff schema mismatch error
+            if (parsedMsg.includes('is_staff') || parsedMsg.includes('schema mismatch') || restRes.status === 400 || restRes.status === 503) {
+              console.warn('[Supabase Storage]: Detected is_staff schema mismatch in Supabase RLS. Local storage fallback will be served to maintain 100% functionality.');
+            }
+          }
+        } catch (restCatchErr) {
+          console.warn('[Supabase Storage REST fetch exception]:', restCatchErr);
         }
       }
 
-      const { data: pubData } = uploadClient.storage
-        .from(bucketUsed)
-        .getPublicUrl(uploadData?.path || fileName);
-
-      const permanentPublicUrl = pubData?.publicUrl || `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+      let permanentPublicUrl = localPublicUrl;
+      if (cloudUploadSuccess) {
+        try {
+          const { data: pubData } = uploadClient.storage
+            .from(bucketUsed)
+            .getPublicUrl(uploadData?.path || fileName);
+          permanentPublicUrl = pubData?.publicUrl || `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+        } catch {
+          permanentPublicUrl = `${SUPABASE_STORAGE_URL}/storage/v1/object/public/${bucketUsed}/${fileName}`;
+        }
+      }
 
       const mediaItem = {
         id: `upload_${timestamp}`,
         url: permanentPublicUrl,
         name: rawName || 'আপলোডকৃত পণ্য ছবি',
-        source: 'supabase_storage',
+        source: cloudUploadSuccess ? 'supabase_storage' : 'local_storage',
         bucket: bucketUsed,
         createdAt: new Date().toISOString(),
         sizeBytes: buffer.length
@@ -3147,7 +3439,11 @@ async function startServer() {
         success: true,
         url: permanentPublicUrl,
         item: mediaItem,
-        fileName
+        fileName,
+        isLocalFallback: !cloudUploadSuccess,
+        warning: cloudUploadSuccess 
+          ? undefined 
+          : 'ছবিটি সফলভাবে লোকাল সার্ভারে সংরক্ষিত হয়েছে। Supabase ক্লাউড স্টোরেজ সরাসরি সক্রিয় করতে Supabase SQL Editor-এ Migration 029 স্ক্রিপ্ট রান করুন।'
       });
     } catch (err: any) {
       console.error('[Supabase Storage Upload Error]:', err);
@@ -3179,6 +3475,43 @@ async function startServer() {
       message: 'Jhadimadi Cloud Storage upload API endpoint is active. Use POST /api/upload to upload files.',
       defaultImage: '/placeholder-product.svg'
     });
+  });
+
+  // Dedicated route for local uploaded assets with caching to ensure fast, reliable access
+  app.use('/assets/uploads', express.static(path.join(process.cwd(), 'public', 'assets', 'uploads'), {
+    maxAge: '30d',
+    immutable: true
+  }));
+
+  // Diagnostic endpoint to check Supabase Storage Health & is_staff status
+  app.get('/api/admin/supabase/storage-health', async (req, res) => {
+    const results: Record<string, any> = {
+      timestamp: new Date().toISOString(),
+      buckets: {}
+    };
+
+    const bucketsToCheck = ['products', 'banners'];
+    for (const b of bucketsToCheck) {
+      try {
+        const testRes = await fetch(`${SUPABASE_STORAGE_URL}/storage/v1/bucket/${b}`, {
+          headers: {
+            apikey: DEFAULT_SUPABASE_KEY,
+            Authorization: `Bearer ${DEFAULT_SUPABASE_KEY}`
+          }
+        });
+        results.buckets[b] = {
+          status: testRes.status,
+          ok: testRes.ok
+        };
+      } catch (err: any) {
+        results.buckets[b] = {
+          status: 500,
+          error: err.message
+        };
+      }
+    }
+
+    res.json({ success: true, ...results });
   });
 
   // Support and redirect any legacy or relative path GET /upload/... or /uploads/... or /_/upload/... requests to Supabase Storage SDK
@@ -3353,7 +3686,6 @@ async function startServer() {
         if (fileName) {
           try {
             await serverSupabase.storage.from(bucket).remove([fileName]);
-            // Product media uses only the canonical products bucket.
           } catch (storageErr) {
             console.warn('[Server] Supabase storage delete notice:', storageErr);
           }
@@ -3715,7 +4047,12 @@ async function startServer() {
 
         // 2. Supabase Cloud Storage catalog fallback
         try {
-          const fetchRes = await fetch(`${SUPABASE_STORAGE_URL}/storage/v1/object/public/products/catalog.json?t=${Date.now()}`);
+          const timeoutCtrl = new AbortController();
+          const tId = setTimeout(() => timeoutCtrl.abort(), 3000);
+          const fetchRes = await fetch(`${SUPABASE_STORAGE_URL}/storage/v1/object/public/products/catalog.json?t=${Date.now()}`, {
+            signal: timeoutCtrl.signal
+          });
+          clearTimeout(tId);
           if (fetchRes.ok) {
             const list = await fetchRes.json();
             if (Array.isArray(list) && list.length > 0) {
@@ -3727,7 +4064,7 @@ async function startServer() {
             }
           }
         } catch (cdnErr) {
-          console.warn('[Server] Storage catalog fetch note:', cdnErr);
+          // Graceful fallback on network/storage miss
         }
       }
 
@@ -3843,9 +4180,12 @@ async function startServer() {
           }
 
           const isNumericId = targetDbId && !isNaN(Number(targetDbId)) && Number(targetDbId) > 0;
+          const isExisting = Boolean(prodId && prodId !== 'new' && prodId !== 'preview_draft_prod');
           const supaPayload: Record<string, any> = {
             name: titleBnVal,
-            price: discountPriceVal || priceVal,
+            price: discountPriceVal > 0 ? discountPriceVal : priceVal,
+            regular_price: priceVal,
+            discount_price: discountPriceVal > 0 ? discountPriceVal : 0,
             description: descVal,
             image_url: imgVal,
             category: product.category || 'Food',
@@ -3859,10 +4199,22 @@ async function startServer() {
             usage_instructions: product.usage_and_storage || product.usageInstructions || null
           };
 
-          if (isNumericId) {
-            const { error: supaErr } = await serverSupabase.from('products').update(supaPayload).eq('id', Number(targetDbId));
+          if (isExisting) {
+            let supaErr: any = null;
+            if (isNumericId) {
+              const res = await serverSupabase.from('products').update(supaPayload).eq('id', Number(targetDbId));
+              supaErr = res.error;
+            } else {
+              const res = await serverSupabase.from('products').update(supaPayload).eq('id', targetDbId);
+              supaErr = res.error;
+            }
             if (supaErr) {
               console.warn('[Server] Supabase products update note:', supaErr.message);
+              const { data: insData } = await serverSupabase.from('products').insert([supaPayload]).select();
+              if (insData && insData[0]?.id) {
+                payload.id = String(insData[0].id);
+                prodId = String(insData[0].id);
+              }
             }
           } else {
             const { data: insData, error: insErr } = await serverSupabase.from('products').insert([supaPayload]).select();
@@ -3930,12 +4282,12 @@ async function startServer() {
         try {
           if (!isNaN(Number(id)) && Number(id) > 0) {
             await serverSupabase.from('products').delete().eq('id', Number(id));
-          } else if (isValidUuid(id)) {
-            await serverSupabase.from('products').delete().eq('id', id);
           }
-          if (!isNaN(Number(dbId)) && Number(dbId) > 0 && dbId !== id) {
-            await serverSupabase.from('products').delete().eq('id', Number(dbId));
-          } else if (isValidUuid(dbId) && dbId !== id) {
+          await serverSupabase.from('products').delete().eq('id', id);
+          if (dbId && dbId !== id) {
+            if (!isNaN(Number(dbId)) && Number(dbId) > 0) {
+              await serverSupabase.from('products').delete().eq('id', Number(dbId));
+            }
             await serverSupabase.from('products').delete().eq('id', dbId);
           }
         } catch (supaErr) {
@@ -4092,98 +4444,69 @@ async function startServer() {
   // Schema: id (UUID), image_url, title, alt_text, target_link, action_url, is_active, display_order, created_at
   // ==========================================
 
-  const mapBannerRow = (d: any) => ({
-    id: String(d.id),
-    title: d.title || d.alt_text || '',
-    altText: d.alt_text || d.title || '',
-    subtitle: d.subtitle || '',
-    tag: d.tag || 'স্পেশাল অফার',
-    imageUrl: d.image_url || d.imageUrl || '',
-    image_url: d.image_url || d.imageUrl || '',
-    link_url: d.link_url || d.target_link || d.action_url || '',
-    linkUrl: d.link_url || d.target_link || d.action_url || '',
-    targetLink: d.link_url || d.target_link || d.action_url || d.targetLink || '',
-    actionUrl: d.link_url || d.action_url || d.target_link || '',
-    placement: d.placement || 'homepage_hero',
-    isActive: d.is_active ?? d.isActive ?? true,
-    displayOrder: Number(d.display_order ?? d.order ?? 0),
-    order: Number(d.display_order ?? d.order ?? 0),
-    createdAt: d.created_at || d.createdAt || new Date().toISOString()
-  });
+  const mapBannerRow = (d: any) => {
+    const img = d.image_url || d.image || d.imageUrl || '';
+    const link = d.link_url || d.target_link || d.action_url || '';
+    return {
+      id: String(d.id),
+      title: d.title || d.alt_text || '',
+      altText: d.alt_text || d.title || '',
+      subtitle: d.subtitle || '',
+      tag: d.tag || d.badge || 'স্পেশাল অফার',
+      imageUrl: img,
+      image_url: img,
+      image: img,
+      link_url: link,
+      linkUrl: link,
+      targetLink: link,
+      actionUrl: link,
+      placement: d.placement || 'homepage_hero',
+      isActive: d.is_active ?? d.isActive ?? true,
+      displayOrder: Number(d.display_order ?? d.sort_order ?? d.order ?? 0),
+      order: Number(d.display_order ?? d.sort_order ?? d.order ?? 0),
+      createdAt: d.created_at || d.createdAt || new Date().toISOString()
+    };
+  };
 
   const BANNERS_DATA_FILE = path.join(DATA_DIR, 'banners.json');
 
   app.get('/api/banners', async (req, res) => {
     try {
-      // 1. Primary: Direct query from Supabase 'banners' table ordered by display_order
+      // 1. Direct query from Supabase 'platform_banners' first
       if (serverSupabase) {
         try {
-          let { data, error } = await serverSupabase
-            .from('banners')
-            .select('*')
-            .order('display_order', { ascending: true });
-
-          if (error) {
-            // Fallback order column if display_order isn't in table yet
-            const fallback = await serverSupabase
-              .from('banners')
-              .select('*')
-              .order('order', { ascending: true });
-            data = fallback.data;
-            error = fallback.error;
-          }
-
-          if (!error && data && Array.isArray(data) && data.length > 0) {
-            const banners = data.map(mapBannerRow);
-            return res.json({ success: true, banners, source: 'supabase_banners' });
-          }
-
-          // 1.1 Secondary Table: Query 'platform_banners' if 'banners' table is empty or pending
-          const platRes = await serverSupabase
+          const { data: pData, error: pError } = await serverSupabase
             .from('platform_banners')
-            .select('*')
-            .order('sort_order', { ascending: true });
-          if (!platRes.error && platRes.data && Array.isArray(platRes.data) && platRes.data.length > 0) {
-            const banners = platRes.data.map(mapBannerRow);
+            .select('*');
+
+          if (!pError && Array.isArray(pData) && pData.length > 0) {
+            const banners = pData.map(mapBannerRow).sort((a: any, b: any) => (a.displayOrder || 0) - (b.displayOrder || 0));
             return res.json({ success: true, banners, source: 'supabase_platform_banners' });
+          }
+        } catch (pbErr) {
+          console.warn('[server] platform_banners query note:', (pbErr as Error)?.message);
+        }
+
+        // 2. Query fallback from 'banners' table
+        try {
+          const { data, error } = await serverSupabase
+            .from('banners')
+            .select('*');
+
+          if (!error && Array.isArray(data) && data.length > 0) {
+            const banners = data.map(mapBannerRow).sort((a: any, b: any) => (a.displayOrder || 0) - (b.displayOrder || 0));
+            return res.json({ success: true, banners, source: 'supabase_banners' });
           }
         } catch (dbErr) {
           console.warn('[server] Supabase banners query note:', (dbErr as Error)?.message);
         }
-
-        // 2. Supabase Cloud Storage catalog fallback (persists across remix even if SQL table pending)
-        try {
-          const { data: fileData, error: sErr } = await serverSupabase.storage
-            .from('products')
-            .download('banners_catalog.json');
-          if (!sErr && fileData) {
-            const text = await fileData.text();
-            const list = JSON.parse(text);
-            if (Array.isArray(list) && list.length > 0) {
-              return res.json({ success: true, banners: list.map(mapBannerRow), source: 'storage_products' });
-            }
-          }
-        } catch {}
-
-        try {
-          const { data: fileData2, error: sErr2 } = await serverSupabase.storage
-            .from('banners')
-            .download('catalog.json');
-          if (!sErr2 && fileData2) {
-            const text = await fileData2.text();
-            const list = JSON.parse(text);
-            if (Array.isArray(list) && list.length > 0) {
-              return res.json({ success: true, banners: list.map(mapBannerRow), source: 'storage_banners' });
-            }
-          }
-        } catch {}
       }
 
-      // 3. Fallback to local server cache
+      // 3. Fallback to local server cache ONLY if Supabase is unavailable
       if (fs.existsSync(BANNERS_DATA_FILE)) {
         try {
           const list = JSON.parse(fs.readFileSync(BANNERS_DATA_FILE, 'utf-8'));
-          if (Array.isArray(list)) {
+          if (Array.isArray(list) && list.length > 0) {
             return res.json({ success: true, banners: list.map(mapBannerRow), source: 'local_cache' });
           }
         } catch {}
@@ -4224,67 +4547,93 @@ async function startServer() {
       };
 
       const syncStatus = {
-        banners: { attempted: false, success: false, note: '' },
-        platform_banners: { attempted: false, success: false, note: '' }
+        banners: { attempted: false, success: false, note: '' }
       };
 
       if (serverSupabase) {
         const isNumBanner = banner.id && !isNaN(Number(banner.id)) && Number(banner.id) > 0;
-        const cleanBannerPayload = {
+        const cleanBannerPayload: Record<string, any> = {
           title: String(payload.title || 'ঝাদিমাদি ব্যানার').trim(),
+          subtitle: payload.subtitle ? String(payload.subtitle).trim() : '',
           image_url: String(payload.image_url || '').trim(),
-          link: String(payload.link_url || payload.target_link || payload.action_url || '/').trim(),
-          subtitle: payload.subtitle ? String(payload.subtitle).trim() : null,
-          badge: payload.tag ? String(payload.tag).trim() : null,
+          link_url: String(payload.link_url || payload.target_link || payload.action_url || '/').trim(),
+          target_link: String(payload.target_link || payload.link_url || '/').trim(),
+          action_url: String(payload.action_url || payload.target_link || payload.link_url || '/').trim(),
+          tag: String(payload.tag || 'স্পেশাল অফার').trim(),
           placement: payload.placement || 'homepage_hero',
-          sort_order: orderVal
+          is_active: payload.is_active ?? true,
+          sort_order: orderVal,
+          display_order: orderVal,
+          updated_at: new Date().toISOString()
         };
 
-        // 1. Primary: Update or Insert into 'banners' table with exact permitted schema columns
+        // Also insert into platform_banners with exact requested columns:
+        try {
+          const pbPayload = {
+            title: String(payload.title || '').trim(),
+            subtitle: payload.subtitle ? String(payload.subtitle).trim() : '',
+            image_url: String(payload.image_url || '').trim(),
+            link_url: String(payload.link_url || payload.target_link || '/').trim()
+          };
+          await serverSupabase.from('platform_banners').insert([pbPayload]);
+        } catch (pbErr) {
+          console.warn('[server] platform_banners insert note:', (pbErr as Error)?.message);
+        }
+
+        // Update or Insert into 'banners' table with resilient column self-healing
         try {
           syncStatus.banners.attempted = true;
-          if (isNumBanner) {
-            const { error: updateErr } = await serverSupabase
-              .from('banners')
-              .update(cleanBannerPayload)
-              .eq('id', Number(banner.id));
+          const working = { ...cleanBannerPayload };
+          const maxRetries = 6;
 
-            if (!updateErr) {
-              syncStatus.banners.success = true;
-            } else {
-              syncStatus.banners.note = `[${updateErr.code}] ${updateErr.message}`;
-            }
-          } else {
-            const { data: insertData, error: insertErr } = await serverSupabase
-              .from('banners')
-              .insert([cleanBannerPayload])
-              .select();
-            if (insertErr) {
-              syncStatus.banners.note = `[${insertErr.code}] ${insertErr.message}`;
-            } else {
-              syncStatus.banners.success = true;
-              if (insertData && insertData[0]?.id) {
-                payload.id = String(insertData[0].id);
+          for (let attempt = 0; attempt < maxRetries; attempt++) {
+            if (isNumBanner) {
+              const { error: updateErr } = await serverSupabase
+                .from('banners')
+                .update(working)
+                .eq('id', Number(banner.id));
+
+              if (!updateErr) {
+                syncStatus.banners.success = true;
+                break;
               }
+
+              if (updateErr.code === '42703' || updateErr.message?.includes('does not exist')) {
+                const match = updateErr.message.match(/column\s+"([^"]+)"/i) || updateErr.message.match(/'([^']+)' column/i);
+                if (match && match[1] && working[match[1]] !== undefined) {
+                  delete working[match[1]];
+                  continue;
+                }
+              }
+              syncStatus.banners.note = `[${updateErr.code}] ${updateErr.message}`;
+              break;
+            } else {
+              const { data: insertData, error: insertErr } = await serverSupabase
+                .from('banners')
+                .insert([working])
+                .select();
+
+              if (!insertErr) {
+                syncStatus.banners.success = true;
+                if (insertData && insertData[0]?.id) {
+                  payload.id = String(insertData[0].id);
+                }
+                break;
+              }
+
+              if (insertErr.code === '42703' || insertErr.message?.includes('does not exist')) {
+                const match = insertErr.message.match(/column\s+"([^"]+)"/i) || insertErr.message.match(/'([^']+)' column/i);
+                if (match && match[1] && working[match[1]] !== undefined) {
+                  delete working[match[1]];
+                  continue;
+                }
+              }
+              syncStatus.banners.note = `[${insertErr.code}] ${insertErr.message}`;
+              break;
             }
           }
         } catch (dbErr) {
           syncStatus.banners.note = (dbErr as Error)?.message || 'Unknown database error';
-        }
-
-        // 2. Secondary: Also mirror to 'platform_banners' table if present
-        try {
-          syncStatus.platform_banners.attempted = true;
-          const platformPayload = {
-            title: cleanBannerPayload.title,
-            image_url: cleanBannerPayload.image_url
-          };
-          const { error: platErr } = await serverSupabase.from('platform_banners').insert([platformPayload]);
-          if (!platErr) {
-            syncStatus.platform_banners.success = true;
-          }
-        } catch (dbErr) {
-          syncStatus.platform_banners.note = (dbErr as Error)?.message || 'Unknown database error';
         }
       }
 
@@ -4335,35 +4684,67 @@ async function startServer() {
     try {
       const { id } = req.params;
       const dbId = toDatabaseUuid(id);
+      let targetImageUrl: string | null = null;
+
       if (serverSupabase) {
+        // Fetch target banner to retrieve its image_url for storage cleanup
+        try {
+          const { data: existing } = await serverSupabase
+            .from('banners')
+            .select('image_url')
+            .or(`id.eq.${id},id.eq.${dbId}`)
+            .maybeSingle();
+          if (existing?.image_url) {
+            targetImageUrl = existing.image_url;
+          }
+        } catch (_) {}
+
+        // Permanently delete from Supabase 'banners' and 'platform_banners' tables
         try {
           if (!isNaN(Number(id)) && Number(id) > 0) {
             await serverSupabase.from('banners').delete().eq('id', Number(id));
-          } else if (isValidUuid(id)) {
-            await serverSupabase.from('banners').delete().eq('id', id);
+            await serverSupabase.from('platform_banners').delete().eq('id', Number(id));
           }
-          if (!isNaN(Number(dbId)) && Number(dbId) > 0 && dbId !== id) {
-            await serverSupabase.from('banners').delete().eq('id', Number(dbId));
-          } else if (isValidUuid(dbId) && dbId !== id) {
+          await serverSupabase.from('banners').delete().eq('id', id);
+          await serverSupabase.from('platform_banners').delete().eq('id', id);
+          if (dbId && dbId !== id) {
+            if (!isNaN(Number(dbId)) && Number(dbId) > 0) {
+              await serverSupabase.from('banners').delete().eq('id', Number(dbId));
+              await serverSupabase.from('platform_banners').delete().eq('id', Number(dbId));
+            }
             await serverSupabase.from('banners').delete().eq('id', dbId);
+            await serverSupabase.from('platform_banners').delete().eq('id', dbId);
           }
         } catch (dbErr) {
           console.warn('[server] Supabase banners delete note:', (dbErr as Error)?.message);
         }
-        try {
-          if (!isNaN(Number(id)) && Number(id) > 0) {
-            await serverSupabase.from('platform_banners').delete().eq('id', Number(id));
-          } else if (isValidUuid(id)) {
-            await serverSupabase.from('platform_banners').delete().eq('id', id);
+
+        // Delete image from storage bucket if applicable
+        if (targetImageUrl && typeof targetImageUrl === 'string') {
+          try {
+            const match = targetImageUrl.match(/\/storage\/v1\/object\/(?:public|sign)\/([^/]+)\/(.*)$/i);
+            if (match && match[1] && match[2]) {
+              const bucket = match[1];
+              const filePath = decodeURIComponent(match[2].split('?')[0]);
+              await serverSupabase.storage.from(bucket).remove([filePath]);
+            }
+          } catch (storageErr) {
+            console.warn('[server] Supabase storage image remove note:', storageErr);
           }
-          if (!isNaN(Number(dbId)) && Number(dbId) > 0 && dbId !== id) {
-            await serverSupabase.from('platform_banners').delete().eq('id', Number(dbId));
-          } else if (isValidUuid(dbId) && dbId !== id) {
-            await serverSupabase.from('platform_banners').delete().eq('id', dbId);
-          }
-        } catch (dbErr) {
-          console.warn('[server] Supabase platform_banners delete note:', (dbErr as Error)?.message);
         }
+
+        // Query remaining banners directly from Supabase table to keep storage catalog 100% in sync
+        try {
+          const { data: remaining } = await serverSupabase.from('banners').select('*');
+          const remainingList = Array.isArray(remaining) ? remaining.map(mapBannerRow) : [];
+          const catalogJson = JSON.stringify(remainingList, null, 2);
+          await serverSupabase.storage
+            .from('products')
+            .upload('banners_catalog.json', Buffer.from(catalogJson), { contentType: 'application/json', upsert: true });
+          await serverSupabase.storage
+            .from('banners')
+            .upload('catalog.json', Buffer.from(catalogJson), { contentType: 'application/json', upsert: true });
+        } catch (_) {}
       }
 
       let currentBanners: any[] = [];
@@ -4372,24 +4753,12 @@ async function startServer() {
           const raw = fs.readFileSync(BANNERS_DATA_FILE, 'utf-8');
           currentBanners = JSON.parse(raw);
           if (Array.isArray(currentBanners)) {
-            currentBanners = currentBanners.filter((b: any) => String(b.id) !== String(id) && String(b.id) !== String(dbId));
+            currentBanners = currentBanners.filter((b: any) => b && b.id && String(b.id) !== String(id) && String(b.id) !== String(dbId));
             fs.writeFileSync(BANNERS_DATA_FILE, JSON.stringify(currentBanners, null, 2), 'utf-8');
           }
         }
       } catch (fErr) {
         console.warn('[server] banners.json delete error:', fErr);
-      }
-
-      if (serverSupabase) {
-        try {
-          const catalogJson = JSON.stringify(currentBanners, null, 2);
-          await serverSupabase.storage
-            .from('products')
-            .upload('banners_catalog.json', Buffer.from(catalogJson), { contentType: 'application/json', upsert: true });
-          await serverSupabase.storage
-            .from('banners')
-            .upload('catalog.json', Buffer.from(catalogJson), { contentType: 'application/json', upsert: true });
-        } catch {}
       }
 
       res.json({ success: true, message: 'Banner deleted successfully' });
@@ -4469,7 +4838,12 @@ async function startServer() {
 
       // Storage catalog fallback
       try {
-        const fetchRes = await fetch(`${SUPABASE_STORAGE_URL}/storage/v1/object/public/products/categories_catalog.json?t=${Date.now()}`);
+        const timeoutCtrl = new AbortController();
+        const tId = setTimeout(() => timeoutCtrl.abort(), 3000);
+        const fetchRes = await fetch(`${SUPABASE_STORAGE_URL}/storage/v1/object/public/products/categories_catalog.json?t=${Date.now()}`, {
+          signal: timeoutCtrl.signal
+        });
+        clearTimeout(tId);
         if (fetchRes.ok) {
           const list = await fetchRes.json();
           if (Array.isArray(list) && list.length > 0) {
@@ -5375,8 +5749,11 @@ async function startServer() {
             {
               id: donorRecord.id,
               name: donorRecord.name,
+              full_name: donorRecord.name,
               blood_group: donorRecord.bloodGroup,
               phone: donorRecord.phone,
+              phone_number: donorRecord.phone,
+              whatsapp_number: donorRecord.phone,
               password: donorRecord.password,
               profession: donorRecord.profession,
               division: donorRecord.division,
@@ -5386,6 +5763,7 @@ async function startServer() {
               last_donation_date: donorRecord.lastDonationDate || null,
               total_donations: donorRecord.totalDonations,
               is_available: donorRecord.available,
+              consent_given: true,
               verified: donorRecord.verified,
               district_unique_id: donorRecord.districtUniqueId,
               created_at: new Date().toISOString(),
@@ -6410,16 +6788,140 @@ async function startServer() {
   });
 
   // 2. LIVE AUTH ENDPOINTS
+  app.post('/api/auth/check-unique', async (req, res) => {
+    const { phone, email } = req.body;
+    const cleanPhone = (phone || '').replace(/[^0-9]/g, '');
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const isSyntheticEmail = !cleanEmail || cleanEmail.endsWith('@jhadimadi.com') || cleanEmail.includes('placeholder');
+
+    const DUPLICATE_MSG = 'এই ফোন নম্বর অথবা ইমেইল দিয়ে ইতিমধ্যে একটি অ্যাকাউন্ট তৈরি করা হয়েছে।';
+
+    // 1. Check in-memory liveUsers
+    const allUsers = Object.values(liveUsers) as any[];
+    for (const u of allUsers) {
+      if (cleanPhone && cleanPhone.length >= 10 && u.phone) {
+        const uPhoneDigits = u.phone.replace(/[^0-9]/g, '');
+        if (uPhoneDigits === cleanPhone || (cleanPhone.endsWith(uPhoneDigits) && uPhoneDigits.length >= 10)) {
+          return res.json({ isAvailable: false, conflictField: 'phone', message: DUPLICATE_MSG });
+        }
+      }
+      if (cleanEmail && !isSyntheticEmail && u.email) {
+        if (u.email.trim().toLowerCase() === cleanEmail) {
+          return res.json({ isAvailable: false, conflictField: 'email', message: DUPLICATE_MSG });
+        }
+      }
+    }
+
+    // 2. Check Supabase profiles table
+    if (serverSupabase) {
+      try {
+        if (cleanPhone && cleanPhone.length >= 10) {
+          const phoneVariants = [
+            cleanPhone,
+            `+88${cleanPhone}`,
+            `88${cleanPhone}`,
+            cleanPhone.startsWith('88') ? cleanPhone.slice(2) : null,
+            cleanPhone.startsWith('+88') ? cleanPhone.slice(3) : null
+          ].filter(Boolean) as string[];
+
+          const { data: phoneMatches } = await serverSupabase
+            .from('profiles')
+            .select('id, phone')
+            .in('phone', phoneVariants)
+            .limit(1);
+
+          if (phoneMatches && phoneMatches.length > 0) {
+            return res.json({ isAvailable: false, conflictField: 'phone', message: DUPLICATE_MSG });
+          }
+        }
+
+        if (cleanEmail && !isSyntheticEmail) {
+          const { data: emailMatches } = await serverSupabase
+            .from('profiles')
+            .select('id, email')
+            .ilike('email', cleanEmail)
+            .limit(1);
+
+          if (emailMatches && emailMatches.length > 0) {
+            return res.json({ isAvailable: false, conflictField: 'email', message: DUPLICATE_MSG });
+          }
+        }
+      } catch (err: any) {
+        console.warn('[Server] check-unique Supabase notice:', err?.message || err);
+      }
+    }
+
+    return res.json({ isAvailable: true });
+  });
+
   app.post('/api/auth/register', async (req, res) => {
     const { name, phone, email, password, division, district, upazila, mahalla, nidFrontUrl, nidBackUrl, selfieUrl } = req.body;
     if ((!phone && !email) || !name) {
       return res.status(400).json({ success: false, message: 'মোবাইল নম্বর অথবা ইমেইল এবং নাম আবশ্যক।' });
     }
 
-    const identifier = (phone || email || '').trim().toLowerCase();
+    const cleanPhone = (phone || '').replace(/[^0-9]/g, '');
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const isSyntheticEmail = !cleanEmail || cleanEmail.endsWith('@jhadimadi.com') || cleanEmail.includes('placeholder');
+    const DUPLICATE_MSG = 'এই ফোন নম্বর অথবা ইমেইল দিয়ে ইতিমধ্যে একটি অ্যাকাউন্ট তৈরি করা হয়েছে।';
 
     if (!password) {
       return res.status(400).json({ success: false, message: 'পাসওয়ার্ড প্রদান করা আবশ্যক।' });
+    }
+
+    // Uniqueness validation against in-memory liveUsers
+    const allUsers = Object.values(liveUsers) as any[];
+    for (const u of allUsers) {
+      if (cleanPhone && cleanPhone.length >= 10 && u.phone) {
+        const uPhoneDigits = u.phone.replace(/[^0-9]/g, '');
+        if (uPhoneDigits === cleanPhone || (cleanPhone.endsWith(uPhoneDigits) && uPhoneDigits.length >= 10)) {
+          return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+        }
+      }
+      if (cleanEmail && !isSyntheticEmail && u.email) {
+        if (u.email.trim().toLowerCase() === cleanEmail) {
+          return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+        }
+      }
+    }
+
+    // Uniqueness validation against Supabase profiles table
+    if (serverSupabase) {
+      try {
+        if (cleanPhone && cleanPhone.length >= 10) {
+          const phoneVariants = [
+            cleanPhone,
+            `+88${cleanPhone}`,
+            `88${cleanPhone}`,
+            cleanPhone.startsWith('88') ? cleanPhone.slice(2) : null,
+            cleanPhone.startsWith('+88') ? cleanPhone.slice(3) : null
+          ].filter(Boolean) as string[];
+
+          const { data: phoneMatches } = await serverSupabase
+            .from('profiles')
+            .select('id, phone')
+            .in('phone', phoneVariants)
+            .limit(1);
+
+          if (phoneMatches && phoneMatches.length > 0) {
+            return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+          }
+        }
+
+        if (cleanEmail && !isSyntheticEmail) {
+          const { data: emailMatches } = await serverSupabase
+            .from('profiles')
+            .select('id, email')
+            .ilike('email', cleanEmail)
+            .limit(1);
+
+          if (emailMatches && emailMatches.length > 0) {
+            return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+          }
+        }
+      } catch (err: any) {
+        console.warn('[Server] Supabase uniqueness check notice:', err?.message || err);
+      }
     }
 
     // Hash password securely with salted scrypt
@@ -6444,14 +6946,16 @@ async function startServer() {
       createdAt: new Date().toISOString().split('T')[0],
     };
 
+    const identifier = (phone || email || '').trim().toLowerCase();
     liveUsers[identifier] = newUser;
     if (phone) liveUsers[phone] = newUser;
+    if (cleanPhone) liveUsers[cleanPhone] = newUser;
     if (email) liveUsers[email.toLowerCase()] = newUser;
 
-    // Synchronize user profile directly to Supabase profiles table
+    // Synchronize user profile directly to Supabase profiles table with 23505 error handling
     try {
       if (serverSupabase) {
-        await serverSupabase.from('profiles').upsert([{
+        const { error: profileError } = await serverSupabase.from('profiles').upsert([{
           id: newUser.id,
           full_name: newUser.name,
           phone: newUser.phone,
@@ -6465,8 +6969,37 @@ async function startServer() {
           is_nid_verified: true,
           updated_at: new Date().toISOString()
         }], { onConflict: 'id' });
+
+        if (profileError) {
+          const isConstraint = 
+            profileError.code === '23505' || 
+            profileError.message?.includes('23505') || 
+            profileError.message?.toLowerCase().includes('duplicate') ||
+            profileError.message?.toLowerCase().includes('unique');
+
+          if (isConstraint) {
+            delete liveUsers[identifier];
+            if (phone) delete liveUsers[phone];
+            if (cleanPhone) delete liveUsers[cleanPhone];
+            if (email) delete liveUsers[email.toLowerCase()];
+            return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+          }
+          console.warn('[Server] Supabase profile upsert warning:', profileError);
+        }
       }
-    } catch (e) {
+    } catch (e: any) {
+      const isConstraint = 
+        e?.code === '23505' || 
+        e?.message?.includes('23505') || 
+        e?.message?.toLowerCase().includes('duplicate key');
+
+      if (isConstraint) {
+        delete liveUsers[identifier];
+        if (phone) delete liveUsers[phone];
+        if (cleanPhone) delete liveUsers[cleanPhone];
+        if (email) delete liveUsers[email.toLowerCase()];
+        return res.status(400).json({ success: false, code: '23505', message: DUPLICATE_MSG });
+      }
       console.warn('[Server] Error persisting user to Supabase profiles:', e);
     }
 
@@ -6474,9 +7007,10 @@ async function startServer() {
     res.json({ success: true, user: safeUser, message: 'রেজিস্ট্রেশন সফল হয়েছে!' });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { phone, email, phoneOrEmail, password } = req.body;
     const identifier = (phoneOrEmail || phone || email || '').trim().toLowerCase();
+    const cleanDigits = identifier.replace(/[^0-9]/g, '');
 
     if (!identifier) {
       return res.status(400).json({ success: false, message: 'মোবাইল নম্বর বা ইমেইল প্রদান করুন।' });
@@ -6486,10 +7020,51 @@ async function startServer() {
     if (!user) {
       // Look up in values by phone or email
       const allUsers = Object.values(liveUsers) as any[];
-      user = allUsers.find((u: any) => 
-        (u.phone && u.phone.trim().toLowerCase() === identifier) || 
-        (u.email && u.email.trim().toLowerCase() === identifier)
-      );
+      user = allUsers.find((u: any) => {
+        const uPhoneDigits = (u.phone || '').replace(/[^0-9]/g, '');
+        return (cleanDigits.length >= 10 && uPhoneDigits === cleanDigits) ||
+          (u.phone && u.phone.trim().toLowerCase() === identifier) || 
+          (u.email && u.email.trim().toLowerCase() === identifier);
+      });
+    }
+
+    // Also look up in Supabase profiles if not in liveUsers
+    if (!user && serverSupabase) {
+      try {
+        const phoneVariants = [
+          identifier,
+          cleanDigits,
+          `+88${cleanDigits}`,
+          `88${cleanDigits}`
+        ].filter(Boolean) as string[];
+
+        let query = serverSupabase.from('profiles').select('*');
+        if (identifier.includes('@')) {
+          query = query.ilike('email', identifier);
+        } else {
+          query = query.in('phone', phoneVariants);
+        }
+
+        const { data: dbProfile } = await query.limit(1).maybeSingle();
+        if (dbProfile) {
+          user = {
+            id: dbProfile.id,
+            name: dbProfile.full_name || 'নিবন্ধিত সদস্য',
+            phone: dbProfile.phone || '',
+            email: dbProfile.email || '',
+            division: dbProfile.division || '',
+            district: dbProfile.district || '',
+            upazila: dbProfile.upazila || '',
+            role: dbProfile.role || 'customer',
+            avatar: dbProfile.avatar_url,
+            isNidVerified: !!dbProfile.is_nid_verified,
+            isPaidMember: !!dbProfile.is_paid_member,
+            createdAt: dbProfile.created_at || new Date().toISOString()
+          };
+        }
+      } catch (dbErr) {
+        console.warn('[Server] Login profile lookup notice:', dbErr);
+      }
     }
 
     if (user) {
@@ -6505,7 +7080,7 @@ async function startServer() {
         }
       }
     } else {
-      return res.status(404).json({ success: false, message: 'কোনো রেজিস্টার্ড অ্যাকাউন্ট পাওয়া যায়নি। অনুগ্রহ করে সাইন আপ করুন।' });
+      return res.status(404).json({ success: false, message: 'এই মোবাইল নম্বর বা ইমেইল দিয়ে কোনো রেজিস্টার্ড অ্যাকাউন্ট পাওয়া যায়নি। অনুগ্রহ করে প্রথমে সাইন আপ করুন।' });
     }
 
     const { password: _p2, ...safeUser } = user;

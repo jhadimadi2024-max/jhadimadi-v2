@@ -48,88 +48,11 @@
           }
         } catch (_) {}
 
-        // 0.05 Early DOM Image Rewriter to prevent 404s on _/upload or aistudio.google.com
-        try {
-          var sanitizeImgSrc = function(val) {
-            if (typeof val !== 'string' || !val) return val;
-            if (val.indexOf('/_/upload') !== -1 || val.indexOf('_/upload') !== -1 || val.indexOf('aistudio.google.com') !== -1) {
-              var m = val.match(/[^/?#]+\.(jpe?g|png|webp|gif|svg|avif)($|\?)/i);
-              if (m && m[0] && m[0].indexOf('undefined') === -1 && m[0].indexOf('null') === -1) {
-                return 'https://cpmqgljtzhlfclqgfdpt.supabase.co/storage/v1/object/public/products/' + encodeURIComponent(m[0]);
-              }
-              return 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300" fill="none"%3E%3Crect width="400" height="300" fill="%23F8FAFC"/%3E%3Ctext x="200" y="150" text-anchor="middle" font-family="sans-serif" font-size="13" fill="%2394A3B8"%3ENo Image Available%3C/text%3E%3C/svg%3E';
-            }
-            return val;
-          };
-
-          if (typeof Element !== 'undefined' && Element.prototype && Element.prototype.setAttribute) {
-            var rawSetAttr = Element.prototype.setAttribute;
-            Element.prototype.setAttribute = function(name, val) {
-              if (this.tagName === 'IMG' && name === 'src') {
-                val = sanitizeImgSrc(val);
-              }
-              return rawSetAttr.call(this, name, val);
-            };
-          }
-
-          if (typeof HTMLImageElement !== 'undefined' && HTMLImageElement.prototype) {
-            var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-            if (imgDesc && imgDesc.set) {
-              var rawImgSet = imgDesc.set;
-              Object.defineProperty(HTMLImageElement.prototype, 'src', {
-                configurable: true,
-                enumerable: true,
-                get: imgDesc.get,
-                set: function(val) {
-                  return rawImgSet.call(this, sanitizeImgSrc(val));
-                }
-              });
-            }
-          }
-        } catch (_) {}
-
-        // 0.1 WebSocket Timeout & Vite HMR Disconnection Graceful Handler
-        try {
-          if (typeof window.WebSocket !== 'undefined') {
-            var NativeWebSocket = window.WebSocket;
-            var PatchedWebSocket = function(url, protocols) {
-              var wsInstance;
-              try {
-                wsInstance = protocols ? new NativeWebSocket(url, protocols) : new NativeWebSocket(url);
-              } catch (wsInitErr) {
-                // Return a harmless dummy proxy if socket creation fails immediately
-                return {
-                  url: url,
-                  readyState: 3, // CLOSED
-                  send: function() {},
-                  close: function() {},
-                  addEventListener: function() {},
-                  removeEventListener: function() {},
-                  onopen: null,
-                  onclose: null,
-                  onerror: null,
-                  onmessage: null
-                };
-              }
-              // Attach default error listener to prevent uncaught exceptions on socket timeout/close
-              wsInstance.addEventListener('error', function(errEvent) {
-                // Silently absorb timeout or early close errors to keep UI thread fluid
-              });
-              return wsInstance;
-            };
-            PatchedWebSocket.prototype = NativeWebSocket.prototype;
-            PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-            PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
-            PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
-            PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
-            window.WebSocket = PatchedWebSocket;
-          }
-        } catch (_) {}
-
         // 1. Unload Event Modernization & Permissions-Policy Shield
         // Replaces deprecated 'unload' event listeners with modern 'pagehide' listeners to prevent BFCache disqualification and policy violations
         try {
-          if (typeof EventTarget !== 'undefined' && EventTarget.prototype) {
+          if (!window.__modernUnloadHandlingInstalled && typeof EventTarget !== 'undefined' && EventTarget.prototype) {
+            window.__modernUnloadHandlingInstalled = true;
             var rawAddEvent = EventTarget.prototype.addEventListener;
             var rawRemoveEvent = EventTarget.prototype.removeEventListener;
             var unloadToPagehideMap = new WeakMap();
@@ -203,37 +126,26 @@
 
         // 2. Safe Fetch Polyfill for Sandboxed Iframe Previews
         try {
-          var rawFetch = window.fetch;
-          var currentFetch = typeof rawFetch === 'function' ? rawFetch.bind(window) : rawFetch;
-
-          var fetchDescriptor = {
-            get: function() {
-              return currentFetch;
-            },
-            set: function(fn) {
-              if (typeof fn === 'function') {
-                currentFetch = fn;
-              }
-            },
-            configurable: true,
-            enumerable: true
-          };
-
-          if (typeof Window !== 'undefined' && Window.prototype) {
-            try {
-              var protoDesc = Object.getOwnPropertyDescriptor(Window.prototype, 'fetch');
-              if (!protoDesc || protoDesc.configurable !== false) {
-                Object.defineProperty(Window.prototype, 'fetch', fetchDescriptor);
-              }
-            } catch (_) {}
+          if (!window.__originalNativeFetch && typeof window.fetch === 'function') {
+            window.__originalNativeFetch = window.fetch.bind(window);
           }
+          var currentFetch = window.__originalNativeFetch;
 
-          try {
-            var winDesc = Object.getOwnPropertyDescriptor(window, 'fetch');
-            if (!winDesc || winDesc.configurable !== false) {
-              Object.defineProperty(window, 'fetch', fetchDescriptor);
-            }
-          } catch (_) {}
+          var winDesc = Object.getOwnPropertyDescriptor(window, 'fetch');
+          if (!winDesc || winDesc.configurable !== false) {
+            Object.defineProperty(window, 'fetch', {
+              get: function() {
+                return currentFetch;
+              },
+              set: function(fn) {
+                if (typeof fn === 'function' && fn !== currentFetch) {
+                  currentFetch = fn;
+                }
+              },
+              configurable: true,
+              enumerable: true
+            });
+          }
         } catch (_) {}
 
         // Suppress any stray 'Cannot set property fetch', unload violation, or WebSocket timeout errors
@@ -484,6 +396,16 @@
         }
       })();
     </script>
+    
+    <!-- Google Maps JavaScript API with YOUR_API_KEY placeholder -->
+    <script>
+      window.initMap = window.initMap || function() {
+        if (typeof window.__googleMapsLoadedCallback === 'function') {
+          window.__googleMapsLoadedCallback();
+        }
+      };
+    </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY&libraries=places&callback=initMap" async defer></script>
   </head>
   <body class="bg-[#faf9f6] text-gray-900">
     <div id="root"></div>

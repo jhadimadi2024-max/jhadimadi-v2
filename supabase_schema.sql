@@ -262,43 +262,73 @@ $$;
 -- 7.2 Check if user is an admin or super_admin
 CREATE OR REPLACE FUNCTION public.is_admin(user_uuid UUID)
 RETURNS BOOLEAN
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, pg_temp
 STABLE
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.user_roles
-    WHERE user_id = user_uuid AND role IN ('admin', 'super_admin')
-  );
+DECLARE
+  v_res BOOLEAN := false;
+BEGIN
+  IF user_uuid IS NULL THEN RETURN false; END IF;
+  IF to_regclass('public.user_roles') IS NOT NULL THEN
+    SELECT EXISTS (
+      SELECT 1 FROM public.user_roles
+      WHERE user_id = user_uuid AND role IN ('admin', 'super_admin')
+    ) INTO v_res;
+  END IF;
+  RETURN COALESCE(v_res, false);
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
 $$;
 
 -- 7.3 Check if user is staff (moderator, admin, or super_admin)
 CREATE OR REPLACE FUNCTION public.is_staff(user_uuid UUID)
 RETURNS BOOLEAN
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, pg_temp
 STABLE
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.user_roles
-    WHERE user_id = user_uuid AND role IN ('moderator', 'admin', 'super_admin')
-  );
+DECLARE
+  v_res BOOLEAN := false;
+BEGIN
+  IF user_uuid IS NULL THEN RETURN false; END IF;
+  IF to_regclass('public.user_roles') IS NOT NULL THEN
+    SELECT EXISTS (
+      SELECT 1 FROM public.user_roles
+      WHERE user_id = user_uuid AND role IN ('moderator', 'admin', 'super_admin')
+    ) INTO v_res;
+  END IF;
+  RETURN COALESCE(v_res, false);
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
 $$;
 
 -- 7.4 Check if user is a super_admin
 CREATE OR REPLACE FUNCTION public.is_super_admin(user_uuid UUID)
 RETURNS BOOLEAN
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, pg_temp
 STABLE
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.user_roles
-    WHERE user_id = user_uuid AND role = 'super_admin'
-  );
+DECLARE
+  v_res BOOLEAN := false;
+BEGIN
+  IF user_uuid IS NULL THEN RETURN false; END IF;
+  IF to_regclass('public.user_roles') IS NOT NULL THEN
+    SELECT EXISTS (
+      SELECT 1 FROM public.user_roles
+      WHERE user_id = user_uuid AND role = 'super_admin'
+    ) INTO v_res;
+  END IF;
+  RETURN COALESCE(v_res, false);
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
 $$;
 
 -- ============================================================================
@@ -664,8 +694,7 @@ CREATE POLICY "Authenticated users can create security log"
 
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES
-  ('products', 'products', true, 15728640, ARRAY['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
-  ('products', 'products', true, 15728640, ARRAY['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
+  ('products', 'products', true, 20971520, ARRAY['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml']),
   ('avatars', 'avatars', true, 5242880, ARRAY['image/png', 'image/jpeg', 'image/webp']),
   ('business-media', 'business-media', true, 10485760, ARRAY['image/png', 'image/jpeg', 'image/webp']),
   ('banners', 'banners', true, 10485760, ARRAY['image/png', 'image/jpeg', 'image/webp']),
@@ -680,36 +709,25 @@ ON CONFLICT (id) DO UPDATE SET
 -- Storage RLS: Public reading of public buckets
 CREATE POLICY "Public Read for Public Buckets"
   ON storage.objects FOR SELECT
-  USING (bucket_id IN ('products', 'products', 'avatars', 'business-media', 'banners', 'service-media'));
+  USING (bucket_id IN ('products', 'avatars', 'business-media', 'banners', 'service-media', 'product-images', 'public-banners'));
 
--- Storage RLS: Allow authenticated uploads to products and asset buckets
+-- Storage RLS: Allow uploads to products and asset buckets
 CREATE POLICY "Allow upload to products bucket"
   ON storage.objects FOR INSERT
   WITH CHECK (
-    bucket_id IN ('products', 'products', 'banners')
-    AND (auth.role() = 'authenticated' OR auth.role() = 'service_role')
+    bucket_id IN ('products', 'banners', 'product-images', 'avatars', 'business-media', 'service-media', 'public-banners')
   );
 
 CREATE POLICY "Allow update in products bucket"
   ON storage.objects FOR UPDATE
   USING (
-    bucket_id IN ('products', 'products', 'banners')
-    AND (
-      auth.role() = 'service_role'
-      OR (EXISTS (SELECT 1 FROM public.is_staff(auth.uid()) WHERE is_staff = true))
-      OR (owner = auth.uid()::text)
-    )
+    bucket_id IN ('products', 'banners', 'product-images', 'avatars', 'business-media', 'service-media', 'public-banners')
   );
 
 CREATE POLICY "Allow delete in products bucket"
   ON storage.objects FOR DELETE
   USING (
-    bucket_id IN ('products', 'products', 'banners')
-    AND (
-      auth.role() = 'service_role'
-      OR (EXISTS (SELECT 1 FROM public.is_staff(auth.uid()) WHERE is_staff = true))
-      OR (owner = auth.uid()::text)
-    )
+    bucket_id IN ('products', 'banners', 'product-images', 'avatars', 'business-media', 'service-media', 'public-banners')
   );
 
 -- Storage RLS: Users can only upload and modify within their own user_id folder for other buckets
@@ -738,3 +756,364 @@ CREATE POLICY "Users delete own files"
 CREATE POLICY "Staff Full Access to Storage"
   ON storage.objects FOR ALL
   USING (public.is_staff(auth.uid()));
+
+-- ============================================================================
+-- STEP 13: JHADIMADI.COM — MIGRATION 025: J-PAY WALLET ATOMIC LEDGER
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.wallets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
+  phone TEXT,
+  balance NUMERIC(14, 2) NOT NULL DEFAULT 0.00 CHECK (balance >= 0),
+  pending_escrow NUMERIC(14, 2) NOT NULL DEFAULT 0.00 CHECK (pending_escrow >= 0),
+  total_deposited NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+  total_withdrawn NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+  total_spent NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+  total_earned NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+  currency TEXT NOT NULL DEFAULT 'BDT',
+  is_frozen BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON public.wallets(user_id);
+CREATE INDEX IF NOT EXISTS idx_wallets_phone ON public.wallets(phone);
+
+CREATE TABLE IF NOT EXISTS public.wallet_transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  wallet_id UUID NOT NULL REFERENCES public.wallets(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL CHECK (type IN (
+    'add_money', 'transfer_in', 'transfer_out', 'purchase',
+    'escrow_hold', 'escrow_release', 'earning', 'withdrawal', 'refund', 'fee'
+  )),
+  amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+  fee NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+  balance_before NUMERIC(14, 2) NOT NULL,
+  balance_after NUMERIC(14, 2) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed', 'cancelled', 'rejected')),
+  payment_method TEXT,
+  trx_id TEXT,
+  sender_number TEXT,
+  receiver_number TEXT,
+  counterpart_user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  reference_id TEXT,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_user_id ON public.wallet_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_wallet_id ON public.wallet_transactions(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_created_at ON public.wallet_transactions(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.wallet_add_money_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+  payment_method TEXT NOT NULL,
+  trx_id TEXT NOT NULL,
+  sender_number TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  admin_note TEXT,
+  approved_by UUID REFERENCES auth.users(id),
+  approved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_add_money_user_id ON public.wallet_add_money_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_add_money_status ON public.wallet_add_money_requests(status);
+
+CREATE TABLE IF NOT EXISTS public.wallet_withdrawals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+  payout_method TEXT NOT NULL,
+  payout_number TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'processing')),
+  admin_note TEXT,
+  processed_by UUID REFERENCES auth.users(id),
+  processed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user_id ON public.wallet_withdrawals(user_id);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON public.wallet_withdrawals(status);
+
+-- RPC 1: wallet_add_money_approve
+CREATE OR REPLACE FUNCTION public.wallet_add_money_approve(
+  p_request_id UUID,
+  p_admin_id UUID DEFAULT NULL
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_req RECORD;
+  v_wallet RECORD;
+  v_before NUMERIC;
+  v_after NUMERIC;
+  v_tx_id UUID;
+BEGIN
+  SELECT * INTO v_req FROM public.wallet_add_money_requests
+  WHERE id = p_request_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Add-money request not found');
+  END IF;
+
+  IF v_req.status != 'pending' THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Request has already been processed');
+  END IF;
+
+  SELECT * INTO v_wallet FROM public.wallets
+  WHERE user_id = v_req.user_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    INSERT INTO public.wallets (user_id, balance) VALUES (v_req.user_id, 0.00)
+    RETURNING * INTO v_wallet;
+  END IF;
+
+  v_before := v_wallet.balance;
+  v_after := v_before + v_req.amount;
+
+  UPDATE public.wallets
+  SET balance = v_after,
+      total_deposited = total_deposited + v_req.amount,
+      updated_at = NOW()
+  WHERE id = v_wallet.id;
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id, user_id, type, amount, balance_before, balance_after,
+    status, payment_method, trx_id, sender_number, reference_id, note
+  ) VALUES (
+    v_wallet.id, v_req.user_id, 'add_money', v_req.amount, v_before, v_after,
+    'completed', v_req.payment_method, v_req.trx_id, v_req.sender_number,
+    p_request_id::TEXT, 'Add money approved by admin'
+  ) RETURNING id INTO v_tx_id;
+
+  UPDATE public.wallet_add_money_requests
+  SET status = 'approved', approved_by = p_admin_id, approved_at = NOW(), updated_at = NOW()
+  WHERE id = p_request_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'message', 'Add money approved successfully',
+    'balance_after', v_after,
+    'transaction_id', v_tx_id
+  );
+END;
+$$;
+
+-- RPC 2: wallet_p2p_transfer
+CREATE OR REPLACE FUNCTION public.wallet_p2p_transfer(
+  p_sender_id UUID,
+  p_receiver_identifier TEXT,
+  p_amount NUMERIC,
+  p_note TEXT DEFAULT ''
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_sender_wallet RECORD;
+  v_receiver_wallet RECORD;
+  v_receiver_user_id UUID;
+  v_sender_before NUMERIC;
+  v_sender_after NUMERIC;
+  v_receiver_before NUMERIC;
+  v_receiver_after NUMERIC;
+BEGIN
+  IF p_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Invalid transfer amount');
+  END IF;
+
+  IF p_receiver_identifier ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+    v_receiver_user_id := p_receiver_identifier::UUID;
+  ELSE
+    SELECT user_id INTO v_receiver_user_id FROM public.wallets WHERE phone = p_receiver_identifier LIMIT 1;
+    IF v_receiver_user_id IS NULL THEN
+      SELECT id INTO v_receiver_user_id FROM auth.users WHERE phone = p_receiver_identifier OR email = p_receiver_identifier LIMIT 1;
+    END IF;
+  END IF;
+
+  IF v_receiver_user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Receiver user not found');
+  END IF;
+
+  IF p_sender_id = v_receiver_user_id THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Cannot transfer to own account');
+  END IF;
+
+  SELECT * INTO v_sender_wallet FROM public.wallets WHERE user_id = p_sender_id FOR UPDATE;
+  IF NOT FOUND OR v_sender_wallet.is_frozen THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Sender wallet unavailable or frozen');
+  END IF;
+
+  IF v_sender_wallet.balance < p_amount THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Insufficient balance');
+  END IF;
+
+  SELECT * INTO v_receiver_wallet FROM public.wallets WHERE user_id = v_receiver_user_id FOR UPDATE;
+  IF NOT FOUND THEN
+    INSERT INTO public.wallets (user_id, balance) VALUES (v_receiver_user_id, 0.00)
+    RETURNING * INTO v_receiver_wallet;
+  END IF;
+
+  v_sender_before := v_sender_wallet.balance;
+  v_sender_after := v_sender_before - p_amount;
+  v_receiver_before := v_receiver_wallet.balance;
+  v_receiver_after := v_receiver_before + p_amount;
+
+  UPDATE public.wallets
+  SET balance = v_sender_after, total_spent = total_spent + p_amount, updated_at = NOW()
+  WHERE id = v_sender_wallet.id;
+
+  UPDATE public.wallets
+  SET balance = v_receiver_after, total_deposited = total_deposited + p_amount, updated_at = NOW()
+  WHERE id = v_receiver_wallet.id;
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id, user_id, type, amount, balance_before, balance_after,
+    counterpart_user_id, note
+  ) VALUES (
+    v_sender_wallet.id, p_sender_id, 'transfer_out', p_amount, v_sender_before, v_sender_after,
+    v_receiver_user_id, COALESCE(p_note, 'P2P Send Money')
+  );
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id, user_id, type, amount, balance_before, balance_after,
+    counterpart_user_id, note
+  ) VALUES (
+    v_receiver_wallet.id, v_receiver_user_id, 'transfer_in', p_amount, v_receiver_before, v_receiver_after,
+    p_sender_id, COALESCE(p_note, 'P2P Received Money')
+  );
+
+  RETURN jsonb_build_object('success', true, 'message', 'Transfer completed successfully', 'new_balance', v_sender_after);
+END;
+$$;
+
+-- RPC 3: wallet_internal_purchase
+CREATE OR REPLACE FUNCTION public.wallet_internal_purchase(
+  p_buyer_id UUID,
+  p_seller_id UUID,
+  p_amount NUMERIC,
+  p_order_ref TEXT,
+  p_description TEXT DEFAULT ''
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_buyer_wallet RECORD;
+  v_seller_wallet RECORD;
+  v_before NUMERIC;
+  v_after NUMERIC;
+BEGIN
+  IF p_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Invalid purchase amount');
+  END IF;
+
+  SELECT * INTO v_buyer_wallet FROM public.wallets WHERE user_id = p_buyer_id FOR UPDATE;
+  IF NOT FOUND OR v_buyer_wallet.balance < p_amount THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Insufficient wallet balance');
+  END IF;
+
+  v_before := v_buyer_wallet.balance;
+  v_after := v_before - p_amount;
+
+  UPDATE public.wallets
+  SET balance = v_after, total_spent = total_spent + p_amount, updated_at = NOW()
+  WHERE id = v_buyer_wallet.id;
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id, user_id, type, amount, balance_before, balance_after,
+    counterpart_user_id, reference_id, note
+  ) VALUES (
+    v_buyer_wallet.id, p_buyer_id, 'purchase', p_amount, v_before, v_after,
+    p_seller_id, p_order_ref, COALESCE(p_description, 'Order purchase payment')
+  );
+
+  IF p_seller_id IS NOT NULL AND p_seller_id != p_buyer_id THEN
+    SELECT * INTO v_seller_wallet FROM public.wallets WHERE user_id = p_seller_id FOR UPDATE;
+    IF NOT FOUND THEN
+      INSERT INTO public.wallets (user_id, balance) VALUES (p_seller_id, 0.00)
+      RETURNING * INTO v_seller_wallet;
+    END IF;
+
+    UPDATE public.wallets
+    SET balance = balance + p_amount, total_earned = total_earned + p_amount, updated_at = NOW()
+    WHERE id = v_seller_wallet.id;
+
+    INSERT INTO public.wallet_transactions (
+      wallet_id, user_id, type, amount, balance_before, balance_after,
+      counterpart_user_id, reference_id, note
+    ) VALUES (
+      v_seller_wallet.id, p_seller_id, 'earning', p_amount,
+      v_seller_wallet.balance, v_seller_wallet.balance + p_amount,
+      p_buyer_id, p_order_ref, 'Sale revenue credited'
+    );
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'message', 'Purchase paid successfully', 'new_balance', v_after);
+END;
+$$;
+
+-- RPC 4: wallet_withdrawal_approve
+CREATE OR REPLACE FUNCTION public.wallet_withdrawal_approve(
+  p_withdrawal_id UUID,
+  p_admin_id UUID DEFAULT NULL
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_w RECORD;
+  v_wallet RECORD;
+  v_before NUMERIC;
+  v_after NUMERIC;
+BEGIN
+  SELECT * INTO v_w FROM public.wallet_withdrawals WHERE id = p_withdrawal_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Withdrawal request not found');
+  END IF;
+
+  IF v_w.status != 'pending' AND v_w.status != 'processing' THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Withdrawal already completed or rejected');
+  END IF;
+
+  SELECT * INTO v_wallet FROM public.wallets WHERE user_id = v_w.user_id FOR UPDATE;
+  IF NOT FOUND OR v_wallet.balance < v_w.amount THEN
+    RETURN jsonb_build_object('success', false, 'message', 'User does not have sufficient balance for withdrawal');
+  END IF;
+
+  v_before := v_wallet.balance;
+  v_after := v_before - v_w.amount;
+
+  UPDATE public.wallets
+  SET balance = v_after, total_withdrawn = total_withdrawn + v_w.amount, updated_at = NOW()
+  WHERE id = v_wallet.id;
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id, user_id, type, amount, balance_before, balance_after,
+    payment_method, receiver_number, reference_id, note
+  ) VALUES (
+    v_wallet.id, v_w.user_id, 'withdrawal', v_w.amount, v_before, v_after,
+    v_w.payout_method, v_w.payout_number, p_withdrawal_id::TEXT, 'Cashout completed'
+  );
+
+  UPDATE public.wallet_withdrawals
+  SET status = 'approved', processed_by = p_admin_id, processed_at = NOW(), updated_at = NOW()
+  WHERE id = p_withdrawal_id;
+
+  RETURN jsonb_build_object('success', true, 'message', 'Withdrawal approved', 'new_balance', v_after);
+END;
+$$;
+
+-- Wallets RLS
+ALTER TABLE public.wallets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.wallet_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.wallet_add_money_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.wallet_withdrawals ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own wallet" ON public.wallets FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can view own transactions" ON public.wallet_transactions FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can view own add money requests" ON public.wallet_add_money_requests FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can create add money requests" ON public.wallet_add_money_requests FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can view own withdrawals" ON public.wallet_withdrawals FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can create withdrawals" ON public.wallet_withdrawals FOR INSERT WITH CHECK (auth.uid() = user_id);
+
